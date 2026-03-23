@@ -6,6 +6,8 @@
 #include "application.h"
 #include "button.h"
 #include "config.h"
+#include <esp_http_server.h>
+#include <cJSON.h>
 
 #include <esp_log.h>
 #include "i2c_device.h"
@@ -217,6 +219,36 @@ private:
     i2c_master_bus_handle_t i2c_bus_;
     esp_io_expander_handle_t io_expander = NULL;
     LcdDisplay* display_;
+    httpd_handle_t http_server_;
+
+    // HTTP handler for remote wakeup
+    static esp_err_t RemoteWakeupHandler(httpd_req_t *req) {
+        ESP_LOGI(TAG, "Received remote wakeup request");
+        
+        // Extract text from query parameter
+        char text[512] = {0};
+        if (httpd_req_get_url_query_str(req, text, sizeof(text)) == ESP_OK) {
+            char value[256] = {0};
+            if (httpd_query_key_value(text, "text", value, sizeof(value)) != ESP_OK) {
+                // No text parameter, use default
+                strcpy(value, "检测到人，自动唤醒");
+            }
+            // URL decode the text using ESP-IDF's official API
+            httpd_unescape_uri(value);
+            Application::GetInstance().WakeWordInvoke(value);
+            ESP_LOGI(TAG, "Woke up with text: %s", value);
+        } else {
+            // No query string, use default
+            Application::GetInstance().WakeWordInvoke("检测到人，自动唤醒");
+            ESP_LOGI(TAG, "Woke up with default text");
+        }
+        
+        // Send JSON response
+        httpd_resp_set_type(req, "application/json");
+        const char *response = "{\"result\": \"ok\", \"woke_up\": true}";
+        httpd_resp_send(req, response, strlen(response));
+        return ESP_OK;
+    }
 
     void InitializeI2c() {
         // Initialize I2C peripheral
@@ -366,9 +398,32 @@ private:
         });
     }
 
+    void StartNetwork() override {
+        WifiBoard::StartNetwork();
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        // Start HTTP server for remote wakeup
+        httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+        config.server_port = 8080;
+        
+        if (httpd_start(&http_server_, &config) == ESP_OK) {
+            httpd_uri_t wakeup_uri = {
+                .uri = "/api/wakeup",
+                .method = HTTP_GET,
+                .handler = RemoteWakeupHandler,
+                .user_ctx = this
+            };
+            httpd_register_uri_handler(http_server_, &wakeup_uri);
+            ESP_LOGI(TAG, "Started HTTP server on port 8080, registered /api/wakeup endpoint for remote wakeup");
+        } else {
+            ESP_LOGE(TAG, "Failed to start HTTP server for remote wakeup");
+        }
+    }
+
 public:
     CustomBoard() :
-        boot_button_(BOOT_BUTTON_GPIO) {
+        boot_button_(BOOT_BUTTON_GPIO),
+        http_server_(nullptr) {
         InitializeI2c();
         InitializeTca9554();
         InitializeSpi();
