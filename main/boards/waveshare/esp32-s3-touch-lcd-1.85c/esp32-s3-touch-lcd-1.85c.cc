@@ -10,6 +10,7 @@
 #include <cJSON.h>
 
 #include <esp_log.h>
+#include <ctype.h>
 #include "i2c_device.h"
 #include <driver/i2c_master.h>
 #include <driver/ledc.h>
@@ -221,6 +222,30 @@ private:
     LcdDisplay* display_;
     httpd_handle_t http_server_;
 
+    // URL decode function
+    static void url_decode(char *dst, const char *src) {
+        char a, b;
+        while (*src) {
+            if (*src == '%' && (a = src[1]) && (b = src[2]) &&
+                isxdigit(a) && isxdigit(b)) {
+                if (a >= 'a') a -= 'a' - 'A';
+                if (a >= 'A') a -= ('A' - 10);
+                else a -= '0';
+                if (b >= 'a') b -= 'a' - 'A';
+                if (b >= 'A') b -= ('A' - 10);
+                else b -= '0';
+                *dst++ = 16 * a + b;
+                src += 3;
+            } else if (*src == '+') {
+                *dst++ = ' ';
+                src++;
+            } else {
+                *dst++ = *src++;
+            }
+        }
+        *dst = '\0';
+    }
+
     // HTTP handler for remote wakeup
     static esp_err_t RemoteWakeupHandler(httpd_req_t *req) {
         ESP_LOGI(TAG, "Received remote wakeup request");
@@ -233,10 +258,11 @@ private:
                 // No text parameter, use default
                 strcpy(value, "检测到人，自动唤醒");
             }
-            // URL decode the text using ESP-IDF's official API
-            httpd_unescape_uri(value);
-            Application::GetInstance().WakeWordInvoke(value);
-            ESP_LOGI(TAG, "Woke up with text: %s", value);
+            // URL decode the value
+            char decoded[256] = {0};
+            url_decode(decoded, value);
+            Application::GetInstance().WakeWordInvoke(decoded);
+            ESP_LOGI(TAG, "Woke up with text: %s", decoded);
         } else {
             // No query string, use default
             Application::GetInstance().WakeWordInvoke("检测到人，自动唤醒");
