@@ -6,6 +6,8 @@
 #include "config.h"
 #include "i2c_device.h"
 #include "assets/lang_config.h"
+#include <esp_http_server.h>
+#include <cJSON.h>
 
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
@@ -16,6 +18,7 @@
 #include "esp32_camera.h"
 #include "power_manager.h"
 #include "power_save_timer.h"
+#include <ctype.h>
 
 #define TAG "esp32s3_korvo2_v3"
 /* ADC Buttons */
@@ -63,6 +66,61 @@ private:
     Esp32Camera* camera_;
     PowerSaveTimer* power_save_timer_;
     PowerManager* power_manager_;
+    httpd_handle_t http_server_;
+
+    // URL decode function
+    static void url_decode(char *dst, const char *src) {
+        char a, b;
+        while (*src) {
+            if (*src == '%' && (a = src[1]) && (b = src[2]) &&
+                isxdigit(a) && isxdigit(b)) {
+                if (a >= 'a') a -= 'a' - 'A';
+                if (a >= 'A') a -= ('A' - 10);
+                else a -= '0';
+                if (b >= 'a') b -= 'a' - 'A';
+                if (b >= 'A') b -= ('A' - 10);
+                else b -= '0';
+                *dst++ = 16 * a + b;
+                src += 3;
+            } else if (*src == '+') {
+                *dst++ = ' ';
+                src++;
+            } else {
+                *dst++ = *src++;
+            }
+        }
+        *dst = '\0';
+    }
+
+    // HTTP handler for remote wakeup
+    static esp_err_t RemoteWakeupHandler(httpd_req_t *req) {
+        ESP_LOGI(TAG, "Received remote wakeup request");
+        
+        // Extract text from query parameter
+        char text[512] = {0};
+        if (httpd_req_get_url_query_str(req, text, sizeof(text)) == ESP_OK) {
+            char value[256] = {0};
+            if (httpd_query_key_value(text, "text", value, sizeof(value)) != ESP_OK) {
+                // No text parameter, use default
+                strcpy(value, "检测到人，自动唤醒");
+            }
+            // URL decode the value
+            char decoded[256] = {0};
+            url_decode(decoded, value);
+            Application::GetInstance().WakeWordInvoke(decoded);
+            ESP_LOGI(TAG, "Woke up with text: %s", decoded);
+        } else {
+            // No query string, use default
+            Application::GetInstance().WakeWordInvoke("检测到人，自动唤醒");
+            ESP_LOGI(TAG, "Woke up with default text");
+        }
+        
+        // Send JSON response
+        httpd_resp_set_type(req, "application/json");
+        const char *response = "{\"result\": \"ok\", \"woke_up\": true}";
+        httpd_resp_send(req, response, strlen(response));
+        return ESP_OK;
+    }
     void InitializePowerManager() {
         // PowerManager需要复用按钮的ADC句柄，所以在InitializeButtons之后调用
         // 传入按钮的ADC句柄指针，让PowerManager复用
@@ -390,8 +448,30 @@ private:
         }
     }
 
+    void StartNetwork() override {
+        WifiBoard::StartNetwork();
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        // Start HTTP server for remote wakeup
+        httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+        config.server_port = 8080;
+        
+        if (httpd_start(&http_server_, &config) == ESP_OK) {
+            httpd_uri_t wakeup_uri = {
+                .uri = "/api/wakeup",
+                .method = HTTP_GET,
+                .handler = RemoteWakeupHandler,
+                .user_ctx = this
+            };
+            httpd_register_uri_handler(http_server_, &wakeup_uri);
+            ESP_LOGI(TAG, "Started HTTP server on port 8080, registered /api/wakeup endpoint for remote wakeup");
+        } else {
+            ESP_LOGE(TAG, "Failed to start HTTP server for remote wakeup");
+        }
+    }
+
 public:
-    Esp32S3Korvo2V3Board() : boot_button_(BOOT_BUTTON_GPIO) {
+    Esp32S3Korvo2V3Board() : boot_button_(BOOT_BUTTON_GPIO), http_server_(nullptr) {
         ESP_LOGI(TAG, "Initializing esp32s3_korvo2_v3 Board");
         InitializePowerSaveTimer();
         InitializeI2c();
